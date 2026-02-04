@@ -40,6 +40,8 @@ def _try_get_session():
     try:
         from snowflake.snowpark.context import get_active_session
         session = get_active_session()
+        # Verify the session actually works by running a trivial query
+        session.sql("SELECT 1").collect()
         from profiler import SnowflakeProfiler
         return session, SnowflakeProfiler(session)
     except Exception:
@@ -52,10 +54,12 @@ def init_session():
 
 
 _session, _profiler = init_session()
-LIVE_MODE = _session is not None
+_HAS_SESSION = _session is not None
 
 if "profile" not in st.session_state:
     st.session_state.profile = None
+if "force_preview" not in st.session_state:
+    st.session_state.force_preview = not _HAS_SESSION
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -69,7 +73,18 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    if LIVE_MODE:
+    # Preview toggle — always visible
+    preview_on = st.toggle(
+        "Preview mode (sample data)",
+        value=st.session_state.force_preview,
+        help="Show the app with mock data. Turn off when connected to Snowflake.",
+    )
+    st.session_state.force_preview = preview_on
+
+    # If user forced preview, or we have no session → preview mode
+    st.session_state.live_mode = _HAS_SESSION and not preview_on
+
+    if st.session_state.live_mode:
         # ── Connected: full interactive sidebar ──────────────────────────
         st.markdown(
             '<div class="connection-status status-connected">'
@@ -176,10 +191,9 @@ with st.sidebar:
         st.checkbox("Sample rows (faster)", value=False, disabled=True)
         st.button("Profile Table", use_container_width=True, type="primary", disabled=True)
 
-        # Load mock data
-        if st.session_state.profile is None:
-            from mock_data import generate_mock_profile
-            st.session_state.profile = generate_mock_profile()
+        # Load mock data automatically in preview mode
+        from mock_data import generate_mock_profile
+        st.session_state.profile = generate_mock_profile()
 
 
 # ── Main area ────────────────────────────────────────────────────────────────
@@ -192,7 +206,7 @@ def main_content():
         return
 
     # Preview banner
-    if not LIVE_MODE:
+    if not st.session_state.get("live_mode", False):
         st.markdown(
             '<div style="background: linear-gradient(90deg, rgba(245,158,11,0.15), rgba(245,158,11,0.05)); '
             'border: 1px solid rgba(245,158,11,0.25); border-radius: 10px; padding: 0.75rem 1.25rem; '
