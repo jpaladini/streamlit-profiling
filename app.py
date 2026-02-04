@@ -1,22 +1,22 @@
-"""Snowflake Data Profiler — a Streamlit in Snowflake (SiS) application
-for profiling tables and views with PDF export.
+"""Snowflake Data Profiler — Streamlit application for profiling
+Snowflake tables and views with PDF export.
 
-Uses snowflake.snowpark get_active_session() — no connection credentials needed.
+Runs natively in Streamlit in Snowflake (SiS) via get_active_session().
+When no Snowflake session is available, falls back to preview mode
+with realistic mock data so the layout can be viewed anywhere.
 """
 
 from __future__ import annotations
 
 import streamlit as st
 import plotly.graph_objects as go
-from snowflake.snowpark.context import get_active_session
 
-from profiler import SnowflakeProfiler, TableProfile, ColumnProfile
+from profiler import TableProfile, ColumnProfile
 from pdf_export import generate_pdf
 from styles import (
     MAIN_CSS,
     get_quality_color_class,
     get_quality_label,
-    get_progress_fill_class,
     render_metric_card,
     render_progress_bar,
     render_stat_item,
@@ -33,20 +33,32 @@ st.set_page_config(
 
 st.markdown(MAIN_CSS, unsafe_allow_html=True)
 
-# ── Session & profiler init ──────────────────────────────────────────────────
+# ── Detect environment ──────────────────────────────────────────────────────
+
+def _try_get_session():
+    """Try to get a Snowpark active session. Returns (session, profiler) or (None, None)."""
+    try:
+        from snowflake.snowpark.context import get_active_session
+        session = get_active_session()
+        from profiler import SnowflakeProfiler
+        return session, SnowflakeProfiler(session)
+    except Exception:
+        return None, None
+
 
 @st.cache_resource
-def get_profiler() -> SnowflakeProfiler:
-    session = get_active_session()
-    return SnowflakeProfiler(session)
+def init_session():
+    return _try_get_session()
 
-profiler = get_profiler()
+
+_session, _profiler = init_session()
+LIVE_MODE = _session is not None
 
 if "profile" not in st.session_state:
     st.session_state.profile = None
 
 
-# ── Sidebar: Object selection ────────────────────────────────────────────────
+# ── Sidebar ──────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown(
@@ -57,84 +69,117 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    # Connection is automatic — show active status
-    st.markdown(
-        '<div class="connection-status status-connected">'
-        '<span class="status-dot dot-green"></span> Connected (active session)'
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("#### Select Object")
-
-    databases = profiler.list_databases()
-    database = st.selectbox("Database", databases, index=None, placeholder="Select database...")
-
-    schemas: list[str] = []
-    schema = None
-    if database:
-        schemas = profiler.list_schemas(database)
-        schema = st.selectbox("Schema", schemas, index=None, placeholder="Select schema...")
-
-    tables: list[dict] = []
-    selected_table = None
-    if database and schema:
-        tables = profiler.list_tables(database, schema)
-        table_options = [
-            f"{'[VIEW] ' if t['TABLE_TYPE'] == 'VIEW' else ''}{t['TABLE_NAME']}"
-            for t in tables
-        ]
-        selected_idx = st.selectbox(
-            "Table / View",
-            range(len(table_options)),
-            format_func=lambda i: table_options[i],
-            index=None,
-            placeholder="Select table...",
+    if LIVE_MODE:
+        # ── Connected: full interactive sidebar ──────────────────────────
+        st.markdown(
+            '<div class="connection-status status-connected">'
+            '<span class="status-dot dot-green"></span> Connected (active session)'
+            "</div>",
+            unsafe_allow_html=True,
         )
-        if selected_idx is not None:
-            selected_table = tables[selected_idx]
 
-    # Profiling options
-    if selected_table:
+        st.markdown("#### Select Object")
+
+        databases = _profiler.list_databases()
+        database = st.selectbox("Database", databases, index=None, placeholder="Select database...")
+
+        schemas: list[str] = []
+        schema = None
+        if database:
+            schemas = _profiler.list_schemas(database)
+            schema = st.selectbox("Schema", schemas, index=None, placeholder="Select schema...")
+
+        tables: list[dict] = []
+        selected_table = None
+        if database and schema:
+            tables = _profiler.list_tables(database, schema)
+            table_options = [
+                f"{'[VIEW] ' if t['TABLE_TYPE'] == 'VIEW' else ''}{t['TABLE_NAME']}"
+                for t in tables
+            ]
+            selected_idx = st.selectbox(
+                "Table / View",
+                range(len(table_options)),
+                format_func=lambda i: table_options[i],
+                index=None,
+                placeholder="Select table...",
+            )
+            if selected_idx is not None:
+                selected_table = tables[selected_idx]
+
+        if selected_table:
+            st.markdown("---")
+            st.markdown("#### Options")
+            use_sample = st.checkbox("Sample rows (faster)", value=False)
+            sample_size = None
+            if use_sample:
+                sample_size = st.number_input("Sample size", 1000, 1_000_000, 100_000, step=10_000)
+
+            profile_clicked = st.button(
+                "Profile Table",
+                use_container_width=True,
+                type="primary",
+            )
+
+            if profile_clicked:
+                with st.spinner(""):
+                    progress_bar = st.progress(0.0)
+                    status_text = st.empty()
+
+                    def on_progress(current: int, total: int, col_name: str):
+                        pct = current / total
+                        progress_bar.progress(pct)
+                        status_text.markdown(
+                            f"<small style='color:#94A3B8'>Profiling column {current}/{total}: "
+                            f"<code>{col_name}</code></small>",
+                            unsafe_allow_html=True,
+                        )
+
+                    profile = _profiler.profile_table(
+                        database=database,
+                        schema=schema,
+                        table=selected_table["TABLE_NAME"],
+                        table_type=selected_table["TABLE_TYPE"],
+                        sample_size=sample_size,
+                        progress_callback=on_progress,
+                    )
+                    st.session_state.profile = profile
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.rerun()
+
+    else:
+        # ── Preview mode: greyed-out controls + demo data ────────────────
+        st.markdown(
+            '<div class="connection-status status-disconnected">'
+            '<span class="status-dot dot-red"></span> Preview Mode'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            '<div style="background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3); '
+            'border-radius: 8px; padding: 0.75rem; margin-bottom: 1rem; font-size: 0.82rem; color: #FBBF24;">'
+            "No Snowflake session detected. Showing preview with sample data. "
+            "Deploy to Streamlit in Snowflake for live profiling."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("#### Select Object")
+        st.selectbox("Database", ["ANALYTICS"], disabled=True)
+        st.selectbox("Schema", ["PUBLIC"], disabled=True)
+        st.selectbox("Table / View", ["ORDERS"], disabled=True)
+
         st.markdown("---")
         st.markdown("#### Options")
-        use_sample = st.checkbox("Sample rows (faster)", value=False)
-        sample_size = None
-        if use_sample:
-            sample_size = st.number_input("Sample size", 1000, 1_000_000, 100_000, step=10_000)
+        st.checkbox("Sample rows (faster)", value=False, disabled=True)
+        st.button("Profile Table", use_container_width=True, type="primary", disabled=True)
 
-        profile_clicked = st.button(
-            "Profile Table",
-            use_container_width=True,
-            type="primary",
-        )
-
-        if profile_clicked:
-            with st.spinner(""):
-                progress_bar = st.progress(0.0)
-                status_text = st.empty()
-
-                def on_progress(current: int, total: int, col_name: str):
-                    pct = current / total
-                    progress_bar.progress(pct)
-                    status_text.markdown(
-                        f"<small style='color:#94A3B8'>Profiling column {current}/{total}: "
-                        f"<code>{col_name}</code></small>",
-                        unsafe_allow_html=True,
-                    )
-
-                profile = profiler.profile_table(
-                    database=database,
-                    schema=schema,
-                    table=selected_table["TABLE_NAME"],
-                    table_type=selected_table["TABLE_TYPE"],
-                    sample_size=sample_size,
-                    progress_callback=on_progress,
-                )
-                st.session_state.profile = profile
-                progress_bar.empty()
-                status_text.empty()
-                st.rerun()
+        # Load mock data
+        if st.session_state.profile is None:
+            from mock_data import generate_mock_profile
+            st.session_state.profile = generate_mock_profile()
 
 
 # ── Main area ────────────────────────────────────────────────────────────────
@@ -145,6 +190,22 @@ def main_content():
     if profile is None:
         _render_empty_state()
         return
+
+    # Preview banner
+    if not LIVE_MODE:
+        st.markdown(
+            '<div style="background: linear-gradient(90deg, rgba(245,158,11,0.15), rgba(245,158,11,0.05)); '
+            'border: 1px solid rgba(245,158,11,0.25); border-radius: 10px; padding: 0.75rem 1.25rem; '
+            'margin-bottom: 1.5rem; display: flex; align-items: center; gap: 0.75rem;">'
+            '<span style="font-size: 1.25rem;">&#x1F441;</span>'
+            '<div>'
+            '<span style="color: #FBBF24; font-weight: 600; font-size: 0.9rem;">Preview Mode</span>'
+            '<span style="color: #94A3B8; font-size: 0.82rem;"> &mdash; '
+            "Viewing sample data from a fictional ORDERS table. "
+            "Deploy to Streamlit in Snowflake to profile your own tables.</span>"
+            "</div></div>",
+            unsafe_allow_html=True,
+        )
 
     _render_header(profile)
     _render_overview_metrics(profile)
@@ -199,7 +260,6 @@ def _render_header(p: TableProfile):
         unsafe_allow_html=True,
     )
 
-    # PDF export button
     col1, col2, col3 = st.columns([6, 2, 2])
     with col3:
         pdf_bytes = generate_pdf(p)
@@ -238,7 +298,6 @@ def _render_overview_tab(p: TableProfile):
         unsafe_allow_html=True,
     )
 
-    # Type distribution chart
     type_counts: dict[str, int] = {}
     for c in p.columns:
         type_counts[c.type_category] = type_counts.get(c.type_category, 0) + 1
@@ -288,7 +347,6 @@ def _render_overview_tab(p: TableProfile):
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
     with col2:
-        # Completeness chart per column
         col_names = [c.name for c in p.columns]
         completeness = [c.completeness_pct for c in p.columns]
         colors = [
@@ -351,11 +409,9 @@ def _render_column_card(col: ColumnProfile, total_rows: int):
         f"</div>"
     )
 
-    # Progress bars
     header_html += render_progress_bar("Completeness", col.completeness_pct)
     header_html += render_progress_bar("Uniqueness", col.uniqueness_pct, "fill-purple")
 
-    # Base stats grid
     header_html += '<div class="stat-grid">'
     header_html += render_stat_item("Total", f"{col.total_count:,}")
     header_html += render_stat_item("Non-Null", f"{col.non_null_count:,}")
@@ -384,9 +440,8 @@ def _render_column_card(col: ColumnProfile, total_rows: int):
         header_html += render_stat_item("True", f"{col.true_count:,}")
         header_html += render_stat_item("False", f"{col.false_count:,}")
 
-    header_html += "</div>"  # stat-grid
+    header_html += "</div>"
 
-    # Top values table
     if col.top_values:
         max_count = col.top_values[0]["count"] if col.top_values else 1
         header_html += '<table class="top-values-table"><thead><tr>'
@@ -405,11 +460,10 @@ def _render_column_card(col: ColumnProfile, total_rows: int):
             )
         header_html += "</tbody></table>"
 
-    header_html += "</div>"  # column-card
+    header_html += "</div>"
 
     st.markdown(header_html, unsafe_allow_html=True)
 
-    # Plotly histogram for numeric columns
     if col.type_category == "numeric" and col.histogram:
         fig = go.Figure(
             go.Bar(
@@ -438,7 +492,6 @@ def _render_column_card(col: ColumnProfile, total_rows: int):
         )
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    # Boolean pie for boolean columns
     if col.type_category == "boolean" and col.non_null_count > 0:
         fig = go.Figure(
             go.Pie(
@@ -518,7 +571,6 @@ def _render_quality_tab(p: TableProfile):
             )
         st.markdown(f'<div class="column-card">{quality_html}</div>', unsafe_allow_html=True)
 
-    # Completeness vs Uniqueness scatter
     st.markdown(
         '<div class="section-header"><h2>Completeness vs Uniqueness</h2></div>',
         unsafe_allow_html=True,
