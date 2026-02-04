@@ -1,12 +1,14 @@
-"""Snowflake Data Profiler — a Streamlit application for profiling
-Snowflake tables and views with PDF export.
+"""Snowflake Data Profiler — a Streamlit in Snowflake (SiS) application
+for profiling tables and views with PDF export.
+
+Uses snowflake.snowpark get_active_session() — no connection credentials needed.
 """
 
 from __future__ import annotations
 
 import streamlit as st
-import snowflake.connector
 import plotly.graph_objects as go
+from snowflake.snowpark.context import get_active_session
 
 from profiler import SnowflakeProfiler, TableProfile, ColumnProfile
 from pdf_export import generate_pdf
@@ -31,14 +33,20 @@ st.set_page_config(
 
 st.markdown(MAIN_CSS, unsafe_allow_html=True)
 
-# ── Session state init ───────────────────────────────────────────────────────
+# ── Session & profiler init ──────────────────────────────────────────────────
 
-for key in ("connected", "conn", "profiler", "profile"):
-    if key not in st.session_state:
-        st.session_state[key] = None if key != "connected" else False
+@st.cache_resource
+def get_profiler() -> SnowflakeProfiler:
+    session = get_active_session()
+    return SnowflakeProfiler(session)
+
+profiler = get_profiler()
+
+if "profile" not in st.session_state:
+    st.session_state.profile = None
 
 
-# ── Sidebar: Connection ─────────────────────────────────────────────────────
+# ── Sidebar: Object selection ────────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown(
@@ -49,139 +57,90 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    st.markdown("#### Connection")
+    # Connection is automatic — show active status
+    st.markdown(
+        '<div class="connection-status status-connected">'
+        '<span class="status-dot dot-green"></span> Connected (active session)'
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-    account = st.text_input("Account", placeholder="xy12345.us-east-1")
-    user = st.text_input("User", placeholder="your_username")
-    password = st.text_input("Password", type="password")
-    warehouse = st.text_input("Warehouse", placeholder="COMPUTE_WH")
-    role = st.text_input("Role (optional)", placeholder="SYSADMIN")
+    st.markdown("#### Select Object")
 
-    connect_clicked = st.button("Connect", use_container_width=True)
+    databases = profiler.list_databases()
+    database = st.selectbox("Database", databases, index=None, placeholder="Select database...")
 
-    if connect_clicked:
-        if not all([account, user, password]):
-            st.error("Account, User, and Password are required.")
-        else:
-            try:
-                conn_params = {
-                    "account": account,
-                    "user": user,
-                    "password": password,
-                }
-                if warehouse:
-                    conn_params["warehouse"] = warehouse
-                if role:
-                    conn_params["role"] = role
+    schemas: list[str] = []
+    schema = None
+    if database:
+        schemas = profiler.list_schemas(database)
+        schema = st.selectbox("Schema", schemas, index=None, placeholder="Select schema...")
 
-                conn = snowflake.connector.connect(**conn_params)
-                st.session_state.conn = conn
-                st.session_state.profiler = SnowflakeProfiler(conn)
-                st.session_state.connected = True
-                st.rerun()
-            except Exception as e:
-                st.error(f"Connection failed: {e}")
-
-    # Connection status
-    if st.session_state.connected:
-        st.markdown(
-            '<div class="connection-status status-connected">'
-            '<span class="status-dot dot-green"></span> Connected'
-            "</div>",
-            unsafe_allow_html=True,
+    tables: list[dict] = []
+    selected_table = None
+    if database and schema:
+        tables = profiler.list_tables(database, schema)
+        table_options = [
+            f"{'[VIEW] ' if t['TABLE_TYPE'] == 'VIEW' else ''}{t['TABLE_NAME']}"
+            for t in tables
+        ]
+        selected_idx = st.selectbox(
+            "Table / View",
+            range(len(table_options)),
+            format_func=lambda i: table_options[i],
+            index=None,
+            placeholder="Select table...",
         )
-    else:
-        st.markdown(
-            '<div class="connection-status status-disconnected">'
-            '<span class="status-dot dot-red"></span> Not connected'
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        if selected_idx is not None:
+            selected_table = tables[selected_idx]
 
-    # ── Object selection ─────────────────────────────────────────────────
-    if st.session_state.connected:
+    # Profiling options
+    if selected_table:
         st.markdown("---")
-        st.markdown("#### Select Object")
-        profiler: SnowflakeProfiler = st.session_state.profiler
+        st.markdown("#### Options")
+        use_sample = st.checkbox("Sample rows (faster)", value=False)
+        sample_size = None
+        if use_sample:
+            sample_size = st.number_input("Sample size", 1000, 1_000_000, 100_000, step=10_000)
 
-        databases = profiler.list_databases()
-        database = st.selectbox("Database", databases, index=None, placeholder="Select database...")
+        profile_clicked = st.button(
+            "Profile Table",
+            use_container_width=True,
+            type="primary",
+        )
 
-        schemas: list[str] = []
-        schema = None
-        if database:
-            schemas = profiler.list_schemas(database)
-            schema = st.selectbox("Schema", schemas, index=None, placeholder="Select schema...")
+        if profile_clicked:
+            with st.spinner(""):
+                progress_bar = st.progress(0.0)
+                status_text = st.empty()
 
-        tables: list[dict] = []
-        selected_table = None
-        if database and schema:
-            tables = profiler.list_tables(database, schema)
-            table_options = [
-                f"{'[VIEW] ' if t['TABLE_TYPE'] == 'VIEW' else ''}{t['TABLE_NAME']}"
-                for t in tables
-            ]
-            selected_idx = st.selectbox(
-                "Table / View",
-                range(len(table_options)),
-                format_func=lambda i: table_options[i],
-                index=None,
-                placeholder="Select table...",
-            )
-            if selected_idx is not None:
-                selected_table = tables[selected_idx]
-
-        # Profiling options
-        if selected_table:
-            st.markdown("---")
-            st.markdown("#### Options")
-            use_sample = st.checkbox("Sample rows (faster)", value=False)
-            sample_size = None
-            if use_sample:
-                sample_size = st.number_input("Sample size", 1000, 1_000_000, 100_000, step=10_000)
-
-            profile_clicked = st.button(
-                "Profile Table",
-                use_container_width=True,
-                type="primary",
-            )
-
-            if profile_clicked:
-                with st.spinner(""):
-                    progress_bar = st.progress(0.0)
-                    status_text = st.empty()
-
-                    def on_progress(current: int, total: int, col_name: str):
-                        pct = current / total
-                        progress_bar.progress(pct)
-                        status_text.markdown(
-                            f"<small style='color:#94A3B8'>Profiling column {current}/{total}: "
-                            f"<code>{col_name}</code></small>",
-                            unsafe_allow_html=True,
-                        )
-
-                    profile = profiler.profile_table(
-                        database=database,
-                        schema=schema,
-                        table=selected_table["TABLE_NAME"],
-                        table_type=selected_table["TABLE_TYPE"],
-                        sample_size=sample_size,
-                        progress_callback=on_progress,
+                def on_progress(current: int, total: int, col_name: str):
+                    pct = current / total
+                    progress_bar.progress(pct)
+                    status_text.markdown(
+                        f"<small style='color:#94A3B8'>Profiling column {current}/{total}: "
+                        f"<code>{col_name}</code></small>",
+                        unsafe_allow_html=True,
                     )
-                    st.session_state.profile = profile
-                    progress_bar.empty()
-                    status_text.empty()
-                    st.rerun()
+
+                profile = profiler.profile_table(
+                    database=database,
+                    schema=schema,
+                    table=selected_table["TABLE_NAME"],
+                    table_type=selected_table["TABLE_TYPE"],
+                    sample_size=sample_size,
+                    progress_callback=on_progress,
+                )
+                st.session_state.profile = profile
+                progress_bar.empty()
+                status_text.empty()
+                st.rerun()
 
 
 # ── Main area ────────────────────────────────────────────────────────────────
 
 def main_content():
     profile: TableProfile | None = st.session_state.profile
-
-    if not st.session_state.connected:
-        _render_welcome()
-        return
 
     if profile is None:
         _render_empty_state()
@@ -207,37 +166,19 @@ def main_content():
         _render_warnings_tab(profile)
 
 
-# ── Welcome / empty states ──────────────────────────────────────────────────
+# ── Empty state ──────────────────────────────────────────────────────────────
 
-def _render_welcome():
+def _render_empty_state():
     st.markdown(
         '<div class="app-header">'
         "<h1>Snowflake Data Profiler</h1>"
-        "<p>Connect to Snowflake and get detailed statistical profiles of your tables and views.</p>"
+        "<p>Select a table or view from the sidebar to generate a detailed profile.</p>"
         "</div>",
         unsafe_allow_html=True,
     )
     st.markdown(
         '<div class="empty-state">'
         '<div class="empty-state-icon">&#x2744;</div>'
-        "<h3>Connect to get started</h3>"
-        "<p>Enter your Snowflake credentials in the sidebar to begin profiling.</p>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-
-def _render_empty_state():
-    st.markdown(
-        '<div class="app-header">'
-        "<h1>Snowflake Data Profiler</h1>"
-        "<p>Select a table or view from the sidebar to generate a profile.</p>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<div class="empty-state">'
-        '<div class="empty-state-icon">&#x1F50D;</div>'
         "<h3>No profile loaded</h3>"
         "<p>Choose a database, schema, and table, then click <strong>Profile Table</strong>.</p>"
         "</div>",
@@ -390,7 +331,6 @@ def _render_overview_tab(p: TableProfile):
 # ── Columns tab ──────────────────────────────────────────────────────────────
 
 def _render_columns_tab(p: TableProfile):
-    # Search / filter
     search = st.text_input("Search columns", placeholder="Filter by name or type...")
     cols = p.columns
     if search:
@@ -530,7 +470,6 @@ def _render_quality_tab(p: TableProfile):
     col1, col2 = st.columns([1, 2])
 
     with col1:
-        # Quality score ring (using Plotly gauge)
         color_map = {
             "quality-excellent": "#10B981",
             "quality-good": "#3B82F6",
@@ -571,7 +510,6 @@ def _render_quality_tab(p: TableProfile):
             unsafe_allow_html=True,
         )
 
-        # Per-column quality bars
         quality_html = ""
         for col in p.columns:
             quality_html += render_progress_bar(

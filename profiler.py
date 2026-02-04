@@ -1,7 +1,11 @@
 """Snowflake data profiling engine.
 
-Executes profiling queries against Snowflake and returns structured results
-for each column including statistics, distributions, and quality metrics.
+Executes profiling queries against Snowflake using a Snowpark Session
+and returns structured results for each column including statistics,
+distributions, and quality metrics.
+
+Designed for Streamlit in Snowflake (SiS) — uses session.sql() instead
+of snowflake.connector cursors.
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
-import snowflake.connector
+from snowflake.snowpark import Session
 
 
 # ── Type classification ──────────────────────────────────────────────────────
@@ -118,20 +122,14 @@ class TableProfile:
 # ── Profiler ─────────────────────────────────────────────────────────────────
 
 class SnowflakeProfiler:
-    """Profiles Snowflake tables and views using efficient SQL aggregations."""
+    """Profiles Snowflake tables and views using Snowpark Session SQL."""
 
-    def __init__(self, conn: snowflake.connector.SnowflakeConnection):
-        self.conn = conn
+    def __init__(self, session: Session):
+        self.session = session
 
-    def _q(self, sql: str, params: dict | None = None) -> pd.DataFrame:
-        cur = self.conn.cursor()
-        try:
-            cur.execute(sql, params)
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
-            return pd.DataFrame(rows, columns=cols)
-        finally:
-            cur.close()
+    def _q(self, sql: str) -> pd.DataFrame:
+        """Execute SQL via Snowpark and return a pandas DataFrame."""
+        return self.session.sql(sql).to_pandas()
 
     def list_databases(self) -> list[str]:
         df = self._q("SHOW DATABASES")
@@ -145,11 +143,11 @@ class SnowflakeProfiler:
         sql = f"""
             SELECT TABLE_NAME, TABLE_TYPE
             FROM "{database}".INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_SCHEMA = %s
+            WHERE TABLE_SCHEMA = '{schema}'
             AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')
             ORDER BY TABLE_TYPE, TABLE_NAME
         """
-        df = self._q(sql, {"1": schema})
+        df = self._q(sql)
         if df.empty:
             return []
         return df.to_dict("records")
@@ -162,10 +160,10 @@ class SnowflakeProfiler:
                 ORDINAL_POSITION,
                 IS_NULLABLE
             FROM "{database}".INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+            WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}'
             ORDER BY ORDINAL_POSITION
         """
-        return self._q(sql, {"1": schema, "2": table})
+        return self._q(sql)
 
     def _get_row_count(self, fqn: str) -> int:
         df = self._q(f"SELECT COUNT(*) AS CNT FROM {fqn}")
@@ -176,10 +174,10 @@ class SnowflakeProfiler:
             sql = f"""
                 SELECT BYTES
                 FROM "{database}".INFORMATION_SCHEMA.TABLE_STORAGE_METRICS
-                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}'
                 LIMIT 1
             """
-            df = self._q(sql, {"1": schema, "2": table})
+            df = self._q(sql)
             if not df.empty and "BYTES" in df.columns:
                 return int(df.iloc[0]["BYTES"])
         except Exception:
@@ -197,7 +195,6 @@ class SnowflakeProfiler:
     ) -> TableProfile:
         fqn = f'"{database}"."{schema}"."{table}"'
 
-        # If sampling is requested, use TABLESAMPLE
         source = fqn
         if sample_size:
             source = f"(SELECT * FROM {fqn} LIMIT {sample_size})"
@@ -228,10 +225,8 @@ class SnowflakeProfiler:
                 total_count=row_count,
             )
 
-            # Base stats query
             self._profile_base_stats(cp, source)
 
-            # Type-specific stats
             if type_cat == "numeric" and cp.non_null_count > 0:
                 self._profile_numeric(cp, source)
             elif type_cat == "string" and cp.non_null_count > 0:
@@ -241,13 +236,11 @@ class SnowflakeProfiler:
             elif type_cat == "boolean" and cp.non_null_count > 0:
                 self._profile_boolean(cp, source)
 
-            # Top values (for all types with data)
             if cp.non_null_count > 0:
                 self._profile_top_values(cp, source)
 
             columns.append(cp)
 
-        # Compute aggregate quality
         import datetime
 
         completeness_vals = [c.completeness_pct for c in columns]
@@ -255,12 +248,9 @@ class SnowflakeProfiler:
         overall_completeness = sum(completeness_vals) / len(completeness_vals) if completeness_vals else 0
         overall_uniqueness = sum(uniqueness_vals) / len(uniqueness_vals) if uniqueness_vals else 0
 
-        # Quality score: weighted combination
         quality_score = (overall_completeness * 0.6) + (overall_uniqueness * 0.15)
-        # Bonus for having data
         if row_count > 0:
             quality_score += 15
-        # Bonus for column diversity
         type_cats = set(c.type_category for c in columns)
         quality_score += min(len(type_cats) * 2.5, 10)
         quality_score = min(quality_score, 100)
@@ -287,10 +277,10 @@ class SnowflakeProfiler:
         col = f'"{cp.name}"'
         sql = f"""
             SELECT
-                COUNT(*) AS total_count,
-                COUNT({col}) AS non_null_count,
-                COUNT(*) - COUNT({col}) AS null_count,
-                COUNT(DISTINCT {col}) AS distinct_count
+                COUNT(*) AS TOTAL_COUNT,
+                COUNT({col}) AS NON_NULL_COUNT,
+                COUNT(*) - COUNT({col}) AS NULL_COUNT,
+                COUNT(DISTINCT {col}) AS DISTINCT_COUNT
             FROM {source}
         """
         df = self._q(sql)
@@ -305,16 +295,16 @@ class SnowflakeProfiler:
         col = f'"{cp.name}"'
         sql = f"""
             SELECT
-                MIN({col}) AS min_val,
-                MAX({col}) AS max_val,
-                AVG({col}) AS mean_val,
-                MEDIAN({col}) AS median_val,
-                STDDEV({col}) AS stddev_val,
-                SUM({col}) AS sum_val,
-                PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY {col}) AS p05,
-                PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {col}) AS p25,
-                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {col}) AS p75,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY {col}) AS p95
+                MIN({col}) AS MIN_VAL,
+                MAX({col}) AS MAX_VAL,
+                AVG({col}) AS MEAN_VAL,
+                MEDIAN({col}) AS MEDIAN_VAL,
+                STDDEV({col}) AS STDDEV_VAL,
+                SUM({col}) AS SUM_VAL,
+                PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY {col}) AS P05,
+                PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {col}) AS P25,
+                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {col}) AS P75,
+                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY {col}) AS P95
             FROM {source}
             WHERE {col} IS NOT NULL
         """
@@ -331,7 +321,6 @@ class SnowflakeProfiler:
         cp.p75 = _safe_float(r.get("P75"))
         cp.p95 = _safe_float(r.get("P95"))
 
-        # Histogram
         self._profile_numeric_histogram(cp, source)
 
     def _profile_numeric_histogram(self, cp: ColumnProfile, source: str):
@@ -341,30 +330,30 @@ class SnowflakeProfiler:
             sql = f"""
                 WITH bounds AS (
                     SELECT
-                        MIN({col})::FLOAT AS min_v,
-                        MAX({col})::FLOAT AS max_v
+                        MIN({col})::FLOAT AS MIN_V,
+                        MAX({col})::FLOAT AS MAX_V
                     FROM {source}
                     WHERE {col} IS NOT NULL
                 ),
                 binned AS (
                     SELECT
                         LEAST(
-                            FLOOR(({col}::FLOAT - b.min_v) / NULLIF((b.max_v - b.min_v) / {num_bins}, 0)),
+                            FLOOR(({col}::FLOAT - b.MIN_V) / NULLIF((b.MAX_V - b.MIN_V) / {num_bins}, 0)),
                             {num_bins - 1}
-                        ) AS bin_idx,
-                        b.min_v,
-                        b.max_v
+                        ) AS BIN_IDX,
+                        b.MIN_V,
+                        b.MAX_V
                     FROM {source}, bounds b
                     WHERE {col} IS NOT NULL
                 )
                 SELECT
-                    bin_idx,
-                    COUNT(*) AS cnt,
-                    MIN(min_v) AS min_v,
-                    MIN(max_v) AS max_v
+                    BIN_IDX,
+                    COUNT(*) AS CNT,
+                    MIN(MIN_V) AS MIN_V,
+                    MIN(MAX_V) AS MAX_V
                 FROM binned
-                GROUP BY bin_idx
-                ORDER BY bin_idx
+                GROUP BY BIN_IDX
+                ORDER BY BIN_IDX
             """
             df = self._q(sql)
             if df.empty:
@@ -389,12 +378,12 @@ class SnowflakeProfiler:
         col = f'"{cp.name}"'
         sql = f"""
             SELECT
-                MIN(LENGTH({col})) AS min_len,
-                MAX(LENGTH({col})) AS max_len,
-                AVG(LENGTH({col})) AS avg_len,
-                SUM(CASE WHEN {col} = '' THEN 1 ELSE 0 END) AS empty_count,
-                MIN({col}) AS min_val,
-                MAX({col}) AS max_val
+                MIN(LENGTH({col})) AS MIN_LEN,
+                MAX(LENGTH({col})) AS MAX_LEN,
+                AVG(LENGTH({col})) AS AVG_LEN,
+                SUM(CASE WHEN {col} = '' THEN 1 ELSE 0 END) AS EMPTY_COUNT,
+                MIN({col}) AS MIN_VAL,
+                MAX({col}) AS MAX_VAL
             FROM {source}
             WHERE {col} IS NOT NULL
         """
@@ -411,9 +400,9 @@ class SnowflakeProfiler:
         col = f'"{cp.name}"'
         sql = f"""
             SELECT
-                MIN({col})::VARCHAR AS min_dt,
-                MAX({col})::VARCHAR AS max_dt,
-                DATEDIFF('day', MIN({col}), MAX({col})) AS range_days
+                MIN({col})::VARCHAR AS MIN_DT,
+                MAX({col})::VARCHAR AS MAX_DT,
+                DATEDIFF('day', MIN({col}), MAX({col})) AS RANGE_DAYS
             FROM {source}
             WHERE {col} IS NOT NULL
         """
@@ -429,8 +418,8 @@ class SnowflakeProfiler:
         col = f'"{cp.name}"'
         sql = f"""
             SELECT
-                SUM(CASE WHEN {col} = TRUE THEN 1 ELSE 0 END) AS true_count,
-                SUM(CASE WHEN {col} = FALSE THEN 1 ELSE 0 END) AS false_count
+                SUM(CASE WHEN {col} = TRUE THEN 1 ELSE 0 END) AS TRUE_COUNT,
+                SUM(CASE WHEN {col} = FALSE THEN 1 ELSE 0 END) AS FALSE_COUNT
             FROM {source}
             WHERE {col} IS NOT NULL
         """
@@ -443,12 +432,12 @@ class SnowflakeProfiler:
         col = f'"{cp.name}"'
         sql = f"""
             SELECT
-                {col}::VARCHAR AS val,
-                COUNT(*) AS cnt
+                {col}::VARCHAR AS VAL,
+                COUNT(*) AS CNT
             FROM {source}
             WHERE {col} IS NOT NULL
             GROUP BY {col}
-            ORDER BY cnt DESC
+            ORDER BY CNT DESC
             LIMIT {limit}
         """
         try:
