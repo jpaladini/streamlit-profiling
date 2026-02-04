@@ -15,7 +15,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
-from snowflake.snowpark import Session
+
+try:
+    from snowflake.snowpark import Session
+except ImportError:
+    Session = None  # Not available outside Snowflake
 
 
 # ── Type classification ──────────────────────────────────────────────────────
